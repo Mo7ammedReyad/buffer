@@ -11,8 +11,6 @@ const connText = document.getElementById("conn-text");
 const sidebarEl = document.getElementById("sidebar");
 const toggleSidebarBtn = document.getElementById("toggle-sidebar-btn");
 
-const keyInput = document.getElementById("buffer-key-input");
-const saveKeyBtn = document.getElementById("save-key-btn");
 const keyStatusEl = document.getElementById("key-status");
 
 let ws = null;
@@ -166,36 +164,6 @@ function setKeyStatus(hasKey) {
     keyStatusEl.className = "key-status missing";
   }
 }
-
-saveKeyBtn.addEventListener("click", async () => {
-  const apiKey = keyInput.value.trim();
-  if (!apiKey) return;
-
-  saveKeyBtn.disabled = true;
-  saveKeyBtn.textContent = "بيحفظ...";
-
-  try {
-    const res = await fetch("/api/key", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apiKey }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      keyInput.value = "";
-      setKeyStatus(true);
-    } else {
-      keyStatusEl.textContent = "✕ فشل الحفظ";
-      keyStatusEl.className = "key-status missing";
-    }
-  } catch {
-    keyStatusEl.textContent = "✕ فشل الاتصال بالسيرفر";
-    keyStatusEl.className = "key-status missing";
-  } finally {
-    saveKeyBtn.disabled = false;
-    saveKeyBtn.textContent = "حفظ";
-  }
-});
 
 toggleSidebarBtn.addEventListener("click", () => {
   sidebarEl.classList.toggle("open");

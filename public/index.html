@@ -308,12 +308,8 @@
 
     <div class="settings-block">
       <label>مفتاح Buffer API</label>
-      <div class="key-input-row">
-        <input type="password" id="buffer-key-input" placeholder="Bearer token..." />
-        <button class="btn-accent" id="save-key-btn">حفظ</button>
-      </div>
       <div class="key-status" id="key-status">بنتأكد...</div>
-      <div class="hint">هتلاقيه في Buffer من Settings → API. المفتاح بيتخزن في KV على السيرفر، مش في المتصفح.</div>
+      <div class="hint">المفتاح بيتضاف يدويًا من Cloudflare Dashboard → KV → AGENT_KV، باسم <code>buffer_api_key</code>. مفيش طريقة تضيفه من هنا عن قصد.</div>
     </div>
 
     <div class="divider"></div>

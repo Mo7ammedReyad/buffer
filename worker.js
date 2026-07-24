@@ -32,38 +32,21 @@ export default {
 // Buffer API key endpoint
 // ---------------------------------------------------------------------------
 
+// Read-only status check. Adding/changing the Buffer key itself is done manually
+// from the Cloudflare Dashboard → KV → AGENT_KV → add an entry with key
+// "buffer_api_key" and the token as the value. There is no write route on
+// purpose — this is a single-key personal deployment.
 async function handleKeyRoute(request, env) {
-  const json = (body, status = 200) =>
-    new Response(JSON.stringify(body), {
-      status,
+  if (request.method !== "GET") {
+    return new Response(JSON.stringify({ ok: false, error: "method not allowed" }), {
+      status: 405,
       headers: { "Content-Type": "application/json" },
     });
-
-  if (request.method === "GET") {
-    const key = await env.AGENT_KV.get("buffer_api_key");
-    return json({ hasKey: Boolean(key) });
   }
-
-  if (request.method === "POST") {
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ ok: false, error: "invalid JSON" }, 400);
-    }
-    if (!body.apiKey || typeof body.apiKey !== "string") {
-      return json({ ok: false, error: "apiKey is required" }, 400);
-    }
-    await env.AGENT_KV.put("buffer_api_key", body.apiKey.trim());
-    return json({ ok: true });
-  }
-
-  if (request.method === "DELETE") {
-    await env.AGENT_KV.delete("buffer_api_key");
-    return json({ ok: true });
-  }
-
-  return json({ ok: false, error: "method not allowed" }, 405);
+  const key = await env.AGENT_KV.get("buffer_api_key");
+  return new Response(JSON.stringify({ hasKey: Boolean(key) }), {
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -116,49 +99,81 @@ function sendJSON(ws, obj) {
 }
 
 // ---------------------------------------------------------------------------
-// Gemini function-calling loop
+// Agent loop — uses a hand-rolled JSON protocol instead of any provider's
+// native "tools" API. This avoids provider-specific requirements (like
+// Gemini's thought_signature) and means the same loop works unchanged with
+// any plain text-in/text-out model — only callModel() needs to change if you
+// swap providers.
+//
+// Protocol (defined in AGENTS.md, enforced here): the model must reply with
+// exactly one JSON object per turn:
+//   {"action":"call_function","name":"...","args":{...}}
+//   {"action":"final_answer","text":"..."}
 // ---------------------------------------------------------------------------
 
 async function runAgentLoop(contents, env) {
   for (let step = 0; step < MAX_AGENT_STEPS; step++) {
-    const data = await callGemini(contents, env);
+    const data = await callModel(contents, env);
     const candidate = data.candidates?.[0];
     const parts = candidate?.content?.parts || [];
+    const rawText = parts.map((p) => p.text || "").join("").trim();
 
-    const functionCallPart = parts.find((p) => p.functionCall);
+    // Keep the raw model turn in history so it has full context next loop.
+    contents.push({ role: "model", parts: [{ text: rawText }] });
 
-    if (functionCallPart) {
-      const { name, args } = functionCallPart.functionCall;
+    const parsed = parseAgentResponse(rawText);
 
-      // Record the model's function call in history
-      contents.push({ role: "model", parts: [{ functionCall: { name, args } }] });
-
+    if (parsed?.action === "call_function" && typeof parsed.name === "string") {
       let result;
       try {
-        result = await executeTool(name, args || {}, env);
+        result = await executeTool(parsed.name, parsed.args || {}, env);
       } catch (err) {
         result = { error: err.message || "unknown error" };
       }
 
-      // Feed the function result back so the model can respond to the user
+      // Function results go back in as a plain "user" turn (no special role
+      // needed) wrapped in a clear marker so the model can recognize it.
       contents.push({
-        role: "function",
-        parts: [{ functionResponse: { name, response: result } }],
+        role: "user",
+        parts: [
+          {
+            text: `[FUNCTION_RESULT name="${parsed.name}"]\n${JSON.stringify(
+              result
+            )}\n[/FUNCTION_RESULT]`,
+          },
+        ],
       });
-
-      continue; // let the model see the result and produce its next step
+      continue;
     }
 
-    const textPart = parts.find((p) => typeof p.text === "string");
-    const finalText = textPart ? textPart.text : "معلش، مش قادر أرد دلوقتي. جرب تاني.";
-    contents.push({ role: "model", parts: [{ text: finalText }] });
-    return finalText;
+    if (parsed?.action === "final_answer" && typeof parsed.text === "string") {
+      return parsed.text;
+    }
+
+    // Model didn't follow the protocol (e.g. plain prose). Fall back to
+    // showing it as-is rather than failing the whole turn.
+    return rawText || "معلش، مش قادر أرد دلوقتي. جرب تاني.";
   }
 
   return "الطلب محتاج خطوات كتير قوي، ممكن تبسطه أو تقسمه؟";
 }
 
-async function callGemini(contents, env) {
+// Extracts a JSON object from the model's raw text, tolerating ```json fences.
+function parseAgentResponse(text) {
+  if (!text) return null;
+  let cleaned = text.trim();
+  const fenced = cleaned.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) cleaned = fenced[1].trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+}
+
+// Plain generateContent call — no `tools`/`functionDeclarations` field at all.
+// Swap this function alone to point at a different model/provider later.
+async function callModel(contents, env) {
   if (!env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY مش متظبط في إعدادات الـ Worker (Secrets).");
   }
@@ -172,7 +187,6 @@ async function callGemini(contents, env) {
     body: JSON.stringify({
       system_instruction: { parts: [{ text: AGENTS_MD }] },
       contents,
-      tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
     }),
   });
 
@@ -182,98 +196,6 @@ async function callGemini(contents, env) {
   }
   return data;
 }
-
-// ---------------------------------------------------------------------------
-// Tool declarations (schema exposed to Gemini)
-// ---------------------------------------------------------------------------
-
-const TOOL_DECLARATIONS = [
-  {
-    name: "get_organizations",
-    description: "List the organizations (workspaces) on the authenticated Buffer account.",
-    parameters: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "get_channels",
-    description: "List connected social channels (profiles) for a given organization.",
-    parameters: {
-      type: "object",
-      properties: { organizationId: { type: "string" } },
-      required: ["organizationId"],
-    },
-  },
-  {
-    name: "create_post",
-    description: "Create/schedule a post on a single channel.",
-    parameters: {
-      type: "object",
-      properties: {
-        text: { type: "string", description: "The post content." },
-        channelId: { type: "string" },
-        mode: {
-          type: "string",
-          enum: ["addToQueue", "customScheduled", "shareNow"],
-        },
-        dueAt: {
-          type: "string",
-          description: "ISO 8601 UTC datetime. Required only when mode is customScheduled.",
-        },
-      },
-      required: ["text", "channelId", "mode"],
-    },
-  },
-  {
-    name: "create_idea",
-    description: "Save a draft idea at the organization level (not tied to a channel or schedule).",
-    parameters: {
-      type: "object",
-      properties: {
-        organizationId: { type: "string" },
-        text: { type: "string" },
-        title: { type: "string" },
-      },
-      required: ["organizationId", "text"],
-    },
-  },
-  {
-    name: "get_posts",
-    description: "List posts for an organization, optionally filtered by status/channels, paginated.",
-    parameters: {
-      type: "object",
-      properties: {
-        organizationId: { type: "string" },
-        status: { type: "string", description: "e.g. scheduled, sent" },
-        channelIds: { type: "array", items: { type: "string" } },
-        first: { type: "number" },
-        after: { type: "string" },
-      },
-      required: ["organizationId"],
-    },
-  },
-  {
-    name: "get_post_metrics",
-    description: "Get performance metrics for a single sent post.",
-    parameters: {
-      type: "object",
-      properties: { postId: { type: "string" } },
-      required: ["postId"],
-    },
-  },
-  {
-    name: "get_aggregated_metrics",
-    description: "Get rolled-up metrics across a date range (max 365 days), optionally filtered by channel.",
-    parameters: {
-      type: "object",
-      properties: {
-        organizationId: { type: "string" },
-        startDateTime: { type: "string", description: "ISO 8601 UTC" },
-        endDateTime: { type: "string", description: "ISO 8601 UTC" },
-        channelIds: { type: "array", items: { type: "string" } },
-      },
-      required: ["organizationId", "startDateTime", "endDateTime"],
-    },
-  },
-];
 
 // ---------------------------------------------------------------------------
 // Tool execution — real calls to Buffer's GraphQL API
@@ -406,7 +328,7 @@ async function executeTool(name, args, env) {
 async function bufferRequest(env, query, variables = {}) {
   const apiKey = await env.AGENT_KV.get("buffer_api_key");
   if (!apiKey) {
-    throw new Error("مفيش مفتاح Buffer API متظبط. ضيفه من شاشة الإعدادات الأول.");
+    throw new Error("مفيش مفتاح Buffer API متظبط في الـ KV. لازم يتضاف يدويًا (buffer_api_key) من Cloudflare Dashboard.");
   }
 
   const res = await fetch(BUFFER_URL, {
@@ -427,7 +349,7 @@ async function bufferRequest(env, query, variables = {}) {
       throw new Error("وصلت لحد الطلبات المسموح بيه على Buffer دلوقتي، جرب كمان شوية.");
     }
     if (code === "UNAUTHORIZED") {
-      throw new Error("مفتاح Buffer API غلط أو منتهي. راجعه من الإعدادات.");
+      throw new Error("مفتاح Buffer API غلط أو منتهي. راجع القيمة المخزنة في KV تحت buffer_api_key.");
     }
     throw new Error(`Buffer (${code}): ${message}`);
   }
