@@ -1,0 +1,24 @@
+{
+  "name": "buffer-publish-agent",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-01",
+
+  // بيخلي الـ Worker يقدر يقرأ ملف AGENTS.md كـ نص عادي (string) وقت الـ build
+  "rules": [
+    { "type": "Text", "globs": ["**/*.md"] }
+  ],
+
+  // ملفات الواجهة (HTML/JS) بتتنشر تلقائي من مجلد public
+  "assets": {
+    "directory": "./public"
+  },
+
+  // KV Namespace اللي هنخزن فيه مفتاح Buffer API
+  // مهم جدًا: بعد ما تعمل الـ KV namespace من الداشبورد، حط الـ id بتاعه هنا بدل PUT_YOUR_KV_NAMESPACE_ID_HERE
+  "kv_namespaces": [
+    {
+      "binding": "AGENT_KV",
+      "id": "PUT_YOUR_KV_NAMESPACE_ID_HERE"
+    }
+  ]
+}
